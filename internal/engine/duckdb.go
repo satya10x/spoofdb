@@ -4,6 +4,7 @@
 package engine
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log"
@@ -255,6 +256,21 @@ func (e *Engine) Query(query string) (*sql.Rows, error) {
 	return e.db.Query(query)
 }
 
+// Conn checks out a dedicated DuckDB connection from the pool. A protocol
+// session that needs per-connection state -- transactions (BEGIN/COMMIT), temp
+// tables, SET -- should run all its statements on one Conn (via RunConn) so that
+// state persists across statements; the pool would otherwise scatter them across
+// connections and a BEGIN wouldn't stick. The caller must Close it on disconnect.
+func (e *Engine) Conn(ctx context.Context) (*sql.Conn, error) {
+	return e.db.Conn(ctx)
+}
+
+// querier is the subset of *sql.DB and *sql.Conn that runOn needs, so the same
+// run logic serves both pooled and pinned-connection execution.
+type querier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
 // QueryResult is a fully-buffered query result. The SQL wire protocols each
 // format Rows according to their own encoding.
 type QueryResult struct {
@@ -262,10 +278,20 @@ type QueryResult struct {
 	Rows [][]any  // raw scanned values; a nil element is SQL NULL
 }
 
-// Run executes query and buffers the entire result set. Suitable for the small
-// result sets this fake serves.
+// Run executes query on a pooled connection and buffers the entire result set.
 func (e *Engine) Run(query string) (*QueryResult, error) {
-	rows, err := e.db.Query(query)
+	return e.runOn(context.Background(), e.db, query)
+}
+
+// RunConn is Run pinned to a specific connection, so per-connection state on
+// that conn (an open transaction, temp tables, session settings) is honored.
+func (e *Engine) RunConn(ctx context.Context, c *sql.Conn, query string) (*QueryResult, error) {
+	return e.runOn(ctx, c, query)
+}
+
+// runOn executes query on q (a pool or a pinned conn) and buffers the result.
+func (e *Engine) runOn(ctx context.Context, q querier, query string) (*QueryResult, error) {
+	rows, err := q.QueryContext(ctx, query)
 	if err != nil {
 		switch classifyErr(err) {
 		case errMissingRelation:

@@ -197,3 +197,52 @@ func TestQueryError(t *testing.T) {
 		t.Errorf("got %d, want 1", one)
 	}
 }
+
+// TestParamsAndTransaction exercises $-parameter binding and a BEGIN/COMMIT
+// transaction with DDL+DML over the extended protocol -- the path a real client
+// (lib/pq, pgx) needs to prepare a query, run it with args, and write results.
+func TestParamsAndTransaction(t *testing.T) {
+	conn := connect(t, startServer(t))
+	ctx := context.Background()
+
+	// Parameterized SELECT against the testdata fixtures.
+	var name string
+	if err := conn.QueryRow(ctx, "SELECT name FROM users WHERE id = $1", 1).Scan(&name); err != nil {
+		t.Fatalf("param select: %v", err)
+	}
+	if name != "alice" {
+		t.Errorf("param select got %q, want alice", name)
+	}
+
+	// Transaction: create a table, insert via params, commit, read back -- all
+	// on one connection, so the BEGIN must stick and tx status must be reported.
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if _, err := tx.Exec(ctx, "CREATE TABLE t_demo (id INT, name TEXT)"); err != nil {
+		t.Fatalf("create in tx: %v", err)
+	}
+	if _, err := tx.Exec(ctx, "INSERT INTO t_demo VALUES ($1, $2)", 7, "carol"); err != nil {
+		t.Fatalf("insert in tx: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	// Exactly one row (no phantom NULL row from describe-time execution), and the
+	// committed data is visible afterward.
+	var cnt int64
+	if err := conn.QueryRow(ctx, "SELECT count(*) FROM t_demo").Scan(&cnt); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if cnt != 1 {
+		t.Errorf("t_demo row count = %d, want 1 (phantom rows from describe?)", cnt)
+	}
+	if err := conn.QueryRow(ctx, "SELECT name FROM t_demo WHERE id = $1", 7).Scan(&name); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if name != "carol" {
+		t.Errorf("read back got %q, want carol", name)
+	}
+}

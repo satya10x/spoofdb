@@ -1,6 +1,8 @@
 package pg
 
 import (
+	"context"
+	"database/sql"
 	"encoding/binary"
 	"fmt"
 	"log"
@@ -16,10 +18,12 @@ import (
 	"github.com/satya10x/spoofdb/internal/fidelity"
 )
 
-// portal is a bound statement ready to execute, plus the result-column formats
-// the client requested (empty = all text, one = applies to all, else per-column).
+// portal is a bound statement ready to execute: its SQL, the parameter values
+// bound to it ($1..$N, in wire order), and the result-column formats the client
+// requested (empty = all text, one = applies to all, else per-column).
 type portal struct {
 	sql     string
+	params  [][]byte
 	formats []int16
 }
 
@@ -27,9 +31,13 @@ type portal struct {
 type session struct {
 	be      *pgproto3.Backend
 	eng     *engine.Engine
+	conn    *sql.Conn // dedicated DuckDB conn, so this client's transactions stick
+	ctx     context.Context
 	stmts   map[string]string  // prepared statement name -> SQL
 	portals map[string]*portal // portal name -> bound portal
 	failed  bool               // set on error; messages skipped until Sync
+	inTx    bool               // a BEGIN is open on this connection
+	txFail  bool               // a statement failed inside the open transaction
 
 	// memo of the most recent query result, so an extended-protocol
 	// Describe followed by Execute of the same SQL runs DuckDB once and
@@ -47,7 +55,7 @@ func (s *session) run(sql string) (*engine.QueryResult, error) {
 	if s.lastRes != nil && s.lastSQL == sql {
 		return s.lastRes, s.lastErr
 	}
-	res, err := s.eng.Run(sql)
+	res, err := s.eng.RunConn(s.ctx, s.conn, sql)
 	s.lastSQL, s.lastRes, s.lastErr = sql, res, err
 	return res, err
 }
@@ -61,9 +69,22 @@ func handleConn(conn net.Conn, eng *engine.Engine) {
 			log.Printf("pg: recovered from panic on connection: %v", r)
 		}
 	}()
+	// Pin one DuckDB connection to this client for its whole session, so
+	// transactions (BEGIN/COMMIT), temp tables and session state persist across
+	// statements instead of scattering across the pool.
+	ctx := context.Background()
+	dbConn, err := eng.Conn(ctx)
+	if err != nil {
+		log.Printf("pg: could not acquire connection: %v", err)
+		return
+	}
+	defer dbConn.Close()
+
 	s := &session{
 		be:      pgproto3.NewBackend(conn, conn),
 		eng:     eng,
+		conn:    dbConn,
+		ctx:     ctx,
 		stmts:   map[string]string{},
 		portals: map[string]*portal{},
 	}
@@ -131,6 +152,7 @@ func (s *session) handle(msg pgproto3.FrontendMessage) (quit bool) {
 		if !s.failed {
 			s.portals[m.DestinationPortal] = &portal{
 				sql:     s.stmts[m.PreparedStatement],
+				params:  m.Parameters,
 				formats: m.ResultFormatCodes,
 			}
 			s.be.Send(&pgproto3.BindComplete{})
@@ -146,7 +168,7 @@ func (s *session) handle(msg pgproto3.FrontendMessage) (quit bool) {
 	case *pgproto3.Sync:
 		s.failed = false
 		s.lastSQL, s.lastRes, s.lastErr = "", nil, nil
-		s.be.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+		s.be.Send(&pgproto3.ReadyForQuery{TxStatus: s.txStatus()})
 		s.be.Flush()
 	case *pgproto3.Flush:
 		s.be.Flush()
@@ -175,7 +197,8 @@ func (s *session) simpleQuery(sql string) {
 		s.ready()
 		return
 	}
-	res, err := s.eng.Run(sql)
+	res, err := s.eng.RunConn(s.ctx, s.conn, sql)
+	s.trackTx(sql, err)
 	if err != nil {
 		s.sendError(err)
 		s.ready()
@@ -208,15 +231,25 @@ func (s *session) emitFidelity(rep *fidelity.Report) {
 // query (via the run memo) to learn its shape; the matching Execute reuses that
 // memoized result, so DuckDB sees the query once per Describe/Execute pair.
 func (s *session) describe(m *pgproto3.Describe) {
-	var sql string
+	var raw string
 	var formats []int16
 	if m.ObjectType == 'S' {
-		sql = s.stmts[m.Name]
-		s.be.Send(&pgproto3.ParameterDescription{})
+		// Report the parameter count so the client (e.g. lib/pq) knows how many
+		// args the statement takes; without this it sees 0 and rejects the exec.
+		raw = s.stmts[m.Name]
+		s.be.Send(&pgproto3.ParameterDescription{ParameterOIDs: make([]uint32, maxParamIndex(raw))})
 	} else if p := s.portals[m.Name]; p != nil {
-		sql, formats = p.sql, p.formats
+		raw, formats = p.sql, p.formats
 	}
-	res, err := s.run(sql)
+	// Only row-returning statements are run here to learn their shape. Running an
+	// INSERT/UPDATE/DELETE/DDL just to describe it would execute its side effects
+	// (and Execute would then run it a second time); those report NoData. Params
+	// are NULL for the shape probe -- it's read-only and no values are bound yet.
+	if !returnsRows(raw) {
+		s.be.Send(&pgproto3.NoData{})
+		return
+	}
+	res, err := s.run(substituteParams(raw, nil))
 	if err != nil {
 		s.sendError(err)
 		s.failed = true
@@ -229,13 +262,25 @@ func (s *session) describe(m *pgproto3.Describe) {
 	s.be.Send(rowDescription(res, formats))
 }
 
+// returnsRows reports whether a statement yields a result set (so it's safe and
+// useful to run at Describe time to learn its column shape). Data-modifying and
+// DDL statements don't, and must not be executed merely to describe them.
+func returnsRows(sql string) bool {
+	switch firstKeyword(sql) {
+	case "SELECT", "WITH", "VALUES", "SHOW", "TABLE", "EXPLAIN", "DESCRIBE", "PRAGMA", "CALL":
+		return true
+	}
+	return false
+}
+
 // execute runs a bound portal and streams its rows in the requested formats.
 func (s *session) execute(m *pgproto3.Execute) {
 	p := s.portals[m.Portal]
 	if p == nil {
 		p = &portal{}
 	}
-	res, err := s.run(p.sql)
+	res, err := s.run(substituteParams(p.sql, p.params))
+	s.trackTx(p.sql, err)
 	if err != nil {
 		s.sendError(err)
 		s.failed = true
@@ -249,8 +294,48 @@ func (s *session) execute(m *pgproto3.Execute) {
 }
 
 func (s *session) ready() {
-	s.be.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+	s.be.Send(&pgproto3.ReadyForQuery{TxStatus: s.txStatus()})
 	s.be.Flush()
+}
+
+// txStatus reports the connection's transaction state in the byte Postgres puts
+// in ReadyForQuery: 'I' idle, 'T' in a transaction, 'E' in a failed transaction.
+// Clients (e.g. lib/pq) rely on this to drive their own transaction state machine.
+func (s *session) txStatus() byte {
+	switch {
+	case s.txFail:
+		return 'E'
+	case s.inTx:
+		return 'T'
+	default:
+		return 'I'
+	}
+}
+
+// trackTx updates the transaction state from a just-executed statement: BEGIN
+// opens a transaction, COMMIT/ROLLBACK close it, and any error inside an open
+// transaction marks it failed (so further statements are rejected until rollback).
+func (s *session) trackTx(sql string, execErr error) {
+	switch firstKeyword(sql) {
+	case "BEGIN", "START":
+		s.inTx, s.txFail = true, false
+	case "COMMIT", "ROLLBACK", "END":
+		s.inTx, s.txFail = false, false
+	default:
+		if execErr != nil && s.inTx {
+			s.txFail = true
+		}
+	}
+}
+
+// firstKeyword returns the upper-cased first word of a SQL statement.
+func firstKeyword(sql string) string {
+	sql = strings.TrimSpace(sql)
+	i := strings.IndexAny(sql, " \t\r\n(;")
+	if i < 0 {
+		i = len(sql)
+	}
+	return strings.ToUpper(sql[:i])
 }
 
 func (s *session) sendError(err error) {
@@ -297,6 +382,76 @@ func resolveFormat(formats []int16, col int) int16 {
 		}
 		return 0
 	}
+}
+
+// scanParams walks sql outside string/identifier literals, finding $N parameter
+// placeholders. It returns the highest index seen and, when replace is non-nil,
+// the SQL with each $N rewritten by replace(N). DuckDB can't run a query that
+// still contains $N with no bound values, so spoofdb inlines them as literals.
+func scanParams(sql string, replace func(idx int) string) (string, int) {
+	var b strings.Builder
+	b.Grow(len(sql))
+	maxIdx := 0
+	var quote byte // 0, '\'' (string) or '"' (identifier)
+	for i := 0; i < len(sql); i++ {
+		c := sql[i]
+		if quote != 0 {
+			b.WriteByte(c)
+			if c == quote {
+				if i+1 < len(sql) && sql[i+1] == quote { // doubled = escaped, stay in
+					b.WriteByte(sql[i+1])
+					i++
+				} else {
+					quote = 0
+				}
+			}
+			continue
+		}
+		if c == '\'' || c == '"' {
+			quote = c
+			b.WriteByte(c)
+			continue
+		}
+		if c == '$' && i+1 < len(sql) && sql[i+1] >= '1' && sql[i+1] <= '9' {
+			j := i + 1
+			for j < len(sql) && sql[j] >= '0' && sql[j] <= '9' {
+				j++
+			}
+			idx, _ := strconv.Atoi(sql[i+1 : j])
+			if idx > maxIdx {
+				maxIdx = idx
+			}
+			if replace != nil {
+				b.WriteString(replace(idx))
+			} else {
+				b.WriteString(sql[i:j])
+			}
+			i = j - 1
+			continue
+		}
+		b.WriteByte(c)
+	}
+	return b.String(), maxIdx
+}
+
+// maxParamIndex returns the highest $N placeholder index in sql (0 if none).
+func maxParamIndex(sql string) int {
+	_, n := scanParams(sql, nil)
+	return n
+}
+
+// substituteParams inlines $1..$N as SQL literals: a present value becomes a
+// quoted text literal (DuckDB casts to the column type), an absent/NULL value
+// becomes NULL. Params arrive as text (lib/pq's default); binary params would be
+// reported via no fidelity channel here, but standard drivers send text.
+func substituteParams(sql string, params [][]byte) string {
+	out, _ := scanParams(sql, func(idx int) string {
+		if idx-1 < len(params) && params[idx-1] != nil {
+			return "'" + strings.ReplaceAll(string(params[idx-1]), "'", "''") + "'"
+		}
+		return "NULL"
+	})
+	return out
 }
 
 // commandTag builds the CommandComplete tag for a statement.
