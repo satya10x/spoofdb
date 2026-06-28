@@ -1,0 +1,52 @@
+# SQL data sources — each is loaded into DuckDB and can be served as any SQL
+# protocol below. Type is one of: dir, parquet, csv, postgres, mysql, clickhouse.
+sources::
+  files::
+    type: "dir"
+    path: "./testdata"
+  # Example live-database source (snapshotted into DuckDB at startup):
+  # orders::
+  #   type: "postgres"
+  #   dsn_env: "ORDERS_PG_DSN"        # or inline: dsn: "host=... dbname=... user=..."
+  #   tables:: "public.orders", "public.users"
+
+# Serve the sources over SQL protocols. Each protocol is a map of named
+# instances ("shards"); each instance has a port and, optionally, the source
+# names it serves (omitted = all sources).
+spoof::
+  postgres::
+    main::
+      port: 5433
+  mysql::
+    main::
+      port: 3306
+  clickhouse::
+    main::
+      port: 9000
+
+  # Sharding is just multiple instances. Point them at the same sources to
+  # replicate a dataset across shards, or at different sources for per-shard data
+  # (a single-element source list uses the dash form):
+  #
+  # mysql::
+  #   shard0::
+  #     port: 3306
+  #     sources::
+  #       - "files"
+  #   shard1::
+  #     port: 3307
+  #     sources::
+  #       - "files"      # same data as shard0
+  #   shard2::
+  #     port: 3308
+  #     sources::
+  #       - "orders_b"   # its own data
+
+# Redis is independent: each instance is seeded from an RDB dump and served over RESP.
+redis::
+  cache::
+    port: 6379
+    dump: "./testdata/cache.rdb"
+  sessions::
+    port: 6380
+    dump: "./testdata/sessions.rdb"

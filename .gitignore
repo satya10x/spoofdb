@@ -1,0 +1,6 @@
+/spoofdb
+/spoofdb-bin
+/spoofdb.db
+/spoofdb.db.wal
+/spoofdb-data
+*.out
